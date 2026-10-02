@@ -8,21 +8,21 @@ on:
       - completed
     branches:
       - main
-      
+
   workflow_dispatch:
     inputs:
       image_tag:
         description: "Tested image SHA to deploy"
         required: true
         type: string
-        
+
 permissions:
   contents: read
   actions: write
 
 jobs:
   deploy-production:
-    name: Deploy to Production
+    name: Blue-Green Deploy to Production
     runs-on: ubuntu-latest
 
     if: >
@@ -49,6 +49,34 @@ jobs:
             --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
             --name ${{ vars.AKS_CLUSTER_NAME }} \
             --overwrite-existing
+
+      # -------------------------------------------------------------
+      # Resolve which image version is being released (Green)
+      # and which version is the current production fallback (Blue).
+      # -------------------------------------------------------------
+      - name: Determine image tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            IMAGE_TAG="${{ github.event.workflow_run.head_sha }}"
+          else
+            IMAGE_TAG="${{ inputs.image_tag }}"
+          fi
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+          echo "Releasing image tag: $IMAGE_TAG"
+
+      - name: Capture current Blue (rollback) image tag
+        run: |
+          CURRENT=$(kubectl get deployment frontend-blue \
+            -n production \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+          BLUE_TAG="${CURRENT##*:}"
+          if [ -z "$BLUE_TAG" ] || [ "$BLUE_TAG" = "placeholder" ]; then
+            BLUE_TAG="$IMAGE_TAG"
+            echo "No valid Blue deployment found; using new tag as Blue baseline."
+          else
+            echo "Existing Blue (production) tag: $BLUE_TAG"
+          fi
+          echo "BLUE_TAG=$BLUE_TAG" >> "$GITHUB_ENV"
 
       - name: Create production namespace
         run: |
@@ -79,82 +107,137 @@ jobs:
             --dry-run=client \
             -o yaml | kubectl apply -f -
 
-      - name: Apply Kubernetes manifests
+      - name: Apply database manifests (shared by Blue and Green)
         run: |
           kubectl apply \
-            -f kubernetes/production/
+            -f kubernetes/production/01-namespace.yaml \
+            -f kubernetes/production/02-user-db.yaml \
+            -f kubernetes/production/03-student-db.yaml \
+            -f kubernetes/production/04-lecturer-db.yaml \
+            -f kubernetes/production/05-course-db.yaml \
+            -f kubernetes/production/06-enrollment-db.yaml
 
-      - name: Update frontend image
+      - name: Apply application manifests (Blue + Green + Services)
         run: |
-          kubectl set image deployment/frontend \
-            frontend=${{ vars.ACR_LOGIN_SERVER }}/koalatech-frontend:${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.image_tag }} \
-            -n production
+          kubectl apply \
+            -f kubernetes/production/07-user-service.yaml \
+            -f kubernetes/production/08-student-service.yaml \
+            -f kubernetes/production/09-lecturer-service.yaml \
+            -f kubernetes/production/10-course-service.yaml \
+            -f kubernetes/production/11-enrollment-service.yaml \
+            -f kubernetes/production/12-frontend.yaml
+      - name: Set Blue and Green images
+        env:
+          ACR: ${{ vars.ACR_LOGIN_SERVER }}
+        run: |
+          set -e
+          for entry in frontend:koalatech-frontend user-service:koalatech-user-service student-service:koalatech-student-service lecturer-service:koalatech-lecturer-service course-service:koalatech-course-service enrollment-service:koalatech-enrollment-service; do
+            svc="${entry%%:*}"
+            img="${entry##*:}"
+            kubectl set image deployment/${svc}-green -n production \
+              ${svc}=${ACR}/${img}:${IMAGE_TAG}
+            kubectl set image deployment/${svc}-blue -n production \
+              ${svc}=${ACR}/${img}:${BLUE_TAG}
+          done
 
-      - name: Update user-service image
+      - name: Wait for Blue rollout (ensure fallback is ready)
         run: |
-          kubectl set image deployment/user-service \
-            user-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-user-service:${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.image_tag }} \
-            -n production
+          for svc in frontend user-service student-service lecturer-service course-service enrollment-service; do
+            kubectl rollout status deployment/${svc}-blue -n production --timeout=300s
+          done
 
-      - name: Update student-service image
+      - name: Deploy Green - wait for rollout
         run: |
-          kubectl set image deployment/student-service \
-            student-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-student-service:${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.image_tag }} \
-            -n production
+          for svc in frontend user-service student-service lecturer-service course-service enrollment-service; do
+            kubectl rollout status deployment/${svc}-green -n production --timeout=300s
+          done
+      - name: Validate Green (application-level health check)
+        run: |
+          set -e
+          local_port=18080
+          for svc in frontend user-service student-service lecturer-service course-service enrollment-service; do
+            if [ "$svc" = "frontend" ]; then
+              remote_port=80
+              path="/"
+            else
+              remote_port=8000
+              path="/health"
+            fi
+            echo "Health checking Green ${svc} -> localhost:${local_port}${path}"
+            kubectl port-forward deployment/${svc}-green -n production ${local_port}:${remote_port} >/tmp/port-forward.log 2>&1 &
+            PF_PID=$!
+            sleep 5
+            curl --fail --silent --retry 5 --retry-delay 2 \
+              "http://localhost:${local_port}${path}" || {
+                echo "::error::Green ${svc} failed health check"
+                kill $PF_PID 2>/dev/null || true
+                exit 1
+              }
+            kill $PF_PID 2>/dev/null || true
+            wait $PF_PID 2>/dev/null || true
+            local_port=$((local_port + 1))
+          done
+          echo "All Green services passed health checks."
+      - name: Switch production traffic to Green
+        run: |
+          for svc in frontend user-service student-service lecturer-service course-service enrollment-service; do
+            kubectl patch service ${svc} -n production \
+              -p '{"spec":{"selector":{"version":"green"}}}'
+          done
+          echo "Traffic switched to Green."
 
-      - name: Update lecturer-service image
+      - name: Monitor Green and rollback on failure
         run: |
-          kubectl set image deployment/lecturer-service \
-            lecturer-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-lecturer-service:${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.image_tag }} \
-            -n production
+          set -e
+          FRONTEND_IP=""
+          for i in {1..30}; do
+            FRONTEND_IP=$(kubectl get service frontend -n production \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            [ -n "$FRONTEND_IP" ] && break
+            sleep 10
+          done
+          if [ -z "$FRONTEND_IP" ]; then
+            echo "::error::Unable to determine frontend IP for monitoring."
+            exit 1
+          fi
 
-      - name: Update course-service image
-        run: |
-          kubectl set image deployment/course-service \
-            course-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-course-service:${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.image_tag }} \
-            -n production
+          echo "Monitoring Green at http://${FRONTEND_IP}"
+          FAILURES=0
+          for i in {1..6}; do
+            if curl --fail --silent --max-time 10 "http://${FRONTEND_IP}/" >/dev/null; then
+              echo "Monitor check ${i}/6: healthy"
+            else
+              echo "Monitor check ${i}/6: FAILED"
+              FAILURES=$((FAILURES + 1))
+            fi
+            sleep 10
+          done
 
-      - name: Update enrollment-service image
-        run: |
-          kubectl set image deployment/enrollment-service \
-            enrollment-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-enrollment-service:${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.image_tag }} \
-            -n production
+          if [ "$FAILURES" -ge 3 ]; then
+            echo "::error::Green failed post-deployment monitoring. Rolling back to Blue."
+            for svc in frontend user-service student-service lecturer-service course-service enrollment-service; do
+              kubectl patch service ${svc} -n production \
+                -p '{"spec":{"selector":{"version":"blue"}}}'
+            done
+            for svc in frontend user-service student-service lecturer-service course-service enrollment-service; do
+              kubectl rollout status deployment/${svc}-blue -n production --timeout=120s
+            done
+            echo "Rolled back to Blue."
+            exit 1
+          fi
 
-      - name: Wait for frontend rollout
+          echo "Green remained healthy. Keeping Green in production."
+      - name: Promote Green to Blue baseline
+        env:
+          ACR: ${{ vars.ACR_LOGIN_SERVER }}
         run: |
-          kubectl rollout status deployment/frontend \
-            -n production \
-            --timeout=300s
-
-      - name: Wait for user-service rollout
-        run: |
-          kubectl rollout status deployment/user-service \
-            -n production \
-            --timeout=300s
-
-      - name: Wait for student-service rollout
-        run: |
-          kubectl rollout status deployment/student-service \
-            -n production \
-            --timeout=300s
-
-      - name: Wait for lecturer-service rollout
-        run: |
-          kubectl rollout status deployment/lecturer-service \
-            -n production \
-            --timeout=300s
-
-      - name: Wait for course-service rollout
-        run: |
-          kubectl rollout status deployment/course-service \
-            -n production \
-            --timeout=300s
-
-      - name: Wait for enrollment-service rollout
-        run: |
-          kubectl rollout status deployment/enrollment-service \
-            -n production \
-            --timeout=300s
+          for entry in frontend:koalatech-frontend user-service:koalatech-user-service student-service:koalatech-student-service lecturer-service:koalatech-lecturer-service course-service:koalatech-course-service enrollment-service:koalatech-enrollment-service; do
+            svc="${entry%%:*}"
+            img="${entry##*:}"
+            kubectl set image deployment/${svc}-blue -n production \
+              ${svc}=${ACR}/${img}:${IMAGE_TAG}
+          done
+          echo "Blue baseline updated to the new production version."
 
       - name: Show production resources
         run: |
