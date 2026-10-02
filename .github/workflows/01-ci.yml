@@ -266,6 +266,8 @@ jobs:
         with:
           command: cves,recommendations
           image: local://${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+          dockerhub-user: ${{ secrets.DOCKER_USER }}
+          dockerhub-password: ${{ secrets.DOCKER_PAT }}
           only-severities: critical,high
           only-fixed: true
           summary: true
